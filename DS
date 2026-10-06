@@ -1,0 +1,97 @@
+#include "file_inclusion.h"
+#include "macro_handler.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char *argv[])
+{
+    char output_name[1024];
+    size_t len;
+    FILE *out;
+    int status;
+
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s inputfile.c\n", argv[0]);
+        return 1;
+    }
+
+    len = strlen(argv[1]);
+    if (len + 3 >= sizeof(output_name)) {
+        fprintf(stderr, "Error: input filename is too long\n");
+        return 1;
+    }
+
+    snprintf(output_name, sizeof(output_name), "%s", argv[1]);
+    if (len >= 2 && strcmp(argv[1] + len - 2, ".c") == 0)
+        snprintf(output_name, sizeof(output_name), "%.*s.i", (int)(len - 2), argv[1]);
+    else
+        snprintf(output_name, sizeof(output_name), "%s.i", argv[1]);
+
+    out = fopen(output_name, "w");
+    if (!out) {
+        perror(output_name);
+        return 1;
+    }
+
+    init_macros();
+    status = process_file(out, argv[1], 0);
+    if (fclose(out) != 0) {
+        perror("output file");
+        return 1;
+    }
+
+    if (status != 0) {
+        fprintf(stderr, "Preprocessing finished with errors. Check the messages above.\n");
+        return 1;
+    }
+
+    printf("Preprocessing completed: %s\n", output_name);
+    return 0;
+}
+int main(int argc, char *argv[])
+{
+    char output_name[1024];
+    size_t len;
+    FILE *out;
+    int status;
+
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s inputfile.c\n", argv[0]);
+        return 1;
+    }
+
+    len = strlen(argv[1]);
+    if (len + 3 >= sizeof(output_name)) {
+        fprintf(stderr, "Error: input filename is too long\n");
+        return 1;
+    }
+
+    snprintf(output_name, sizeof(output_name), "%s", argv[1]);
+    if (len >= 2 && strcmp(argv[1] + len - 2, ".c") == 0)
+        snprintf(output_name, sizeof(output_name), "%.*s.i", (int)(len - 2), argv[1]);
+    else
+        snprintf(output_name, sizeof(output_name), "%s.i", argv[1]);
+
+    out = fopen(output_name, "w");
+    if (!out) {
+        perror(output_name);
+        return 1;
+    }
+
+    init_macros();
+    status = process_file(out, argv[1], 0);
+    if (fclose(out) != 0) {
+        perror("output file");
+        return 1;
+    }
+
+    if (status != 0) {
+        fprintf(stderr, "Preprocessing finished with errors. Check the messages above.\n");
+        return 1;
+    }
+
+    printf("Preprocessing completed: %s\n", output_name);
+    return 0;
+}
