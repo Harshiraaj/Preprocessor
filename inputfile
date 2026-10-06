@@ -1,0 +1,393 @@
+#include "comment_removal.h"
+#include "file_inclusion.h"
+#include "macro_handler.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define LINE_SIZE 4096
+#define EXPANDED_SIZE 16384
+
+int remove_comments(FILE *in, FILE *out)
+{
+    int c, next;
+    int state = 0; /* 0=normal, 1=string, 2=character, 3=line comment, 4=block comment */
+
+    while ((c = fgetc(in)) != EOF) {
+        if (state == 0) {
+            if (c == '"') {
+                state = 1;
+                fputc(c, out);
+            } else if (c == '\'') {
+                state = 2;
+                fputc(c, out);
+            } else if (c == '/') {
+                next = fgetc(in);
+                if (next == '/') {
+                    state = 3;
+                    fputc(' ', out);
+                } else if (next == '*') {
+                    state = 4;
+                    fputc(' ', out);
+                } else {
+                    fputc(c, out);
+                    if (next != EOF) ungetc(next, in);
+                }
+            } else {
+                fputc(c, out);
+            }
+        } else if (state == 1 || state == 2) {
+            fputc(c, out);
+            if (c == '\\') {
+                next = fgetc(in);
+                if (next != EOF) fputc(next, out);
+            } else if ((state == 1 && c == '"') ||
+                       (state == 2 && c == '\'')) {
+                state = 0;
+            }
+        } else if (state == 3) {
+            if (c == '\n') {
+                fputc('\n', out);
+                state = 0;
+            }
+        } else if (state == 4) {
+            if (c == '\n') fputc('\n', out);
+            if (c == '*') {
+                next = fgetc(in);
+                if (next == '/') state = 0;
+                else if (next != EOF) ungetc(next, in);
+            }
+        }
+    }
+    return ferror(in) || ferror(out) ? -1 : 0;
+}
+
+static int handle_file(FILE *out, const char *filename, int depth);
+
+static int parse_include(const char *line, char *name, size_t size)
+{
+    const char *p = line, *start, *end;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "#include", 8) != 0) return 0;
+    p += 8;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p != '"' && *p != '<') return -1;
+    start = ++p;
+    end = (*line && strchr(line, '<') && !strchr(line, '"')) ? strchr(p, '>') : strchr(p, '"');
+    if (!end) return -1;
+    if ((size_t)(end - start) >= size) return -1;
+    memcpy(name, start, (size_t)(end - start));
+    name[end - start] = '\0';
+    return 1;
+}
+
+static int handle_file(FILE *out, const char *filename, int depth)
+{
+    FILE *in, *clean;
+    char tempname[L_tmpnam], line[LINE_SIZE], expanded[EXPANDED_SIZE];
+    int result = 0;
+
+    if (depth > 20) {
+        fprintf(stderr, "Error: include nesting too deep at %s\n", filename);
+        return -1;
+    }
+    in = fopen(filename, "r");
+    if (!in) {
+        perror(filename);
+        return -1;
+    }
+    if (!tmpnam(tempname)) {
+        fclose(in);
+        fprintf(stderr, "Error: cannot create temporary filename\n");
+        return -1;
+    }
+    clean = fopen(tempname, "w+");
+    if (!clean) {
+        fclose(in);
+        perror("temporary file");
+        return -1;
+    }
+    if (remove_comments(in, clean) != 0) result = -1;
+    fclose(in);
+    rewind(clean);
+
+    while (fgets(line, sizeof(line), clean)) {
+        char include_name[1024];
+        int inc, def;
+        inc = parse_include(line, include_name, sizeof(include_name));
+        if (inc == 1) {
+            if (handle_file(out, include_name, depth + 1) != 0) result = -1;
+        } else if (inc == -1) {
+            fprintf(stderr, "Warning: unsupported include directive: %s", line);
+            fputs(line, out);
+        } else {
+            def = define_macro(line);
+            if (def == 1) {
+                /* Macro definitions are stored and are not emitted to the .i file. */
+            } else if (def == -1) {
+                fprintf(stderr, "Warning: invalid macro definition: %s", line);
+                fputs(line, out);
+            } else {
+                substitute_macros(line, expanded, sizeof(expanded));
+                fputs(expanded, out);
+            }
+        }
+    }
+    fclose(clean);
+    remove(tempname);
+    return result;
+}
+
+int process_file(FILE *out, const char *filename, int depth)
+{
+    return handle_file(out, filename, depth);
+}
+#include "macro_handler.h"
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static Macro macros[MAX_MACROS];
+static int macro_count = 0;
+
+void init_macros(void)
+{
+    macro_count = 0;
+}
+
+static void trim(char *s)
+{
+    size_t n;
+    while (isspace((unsigned char)*s)) memmove(s, s + 1, strlen(s));
+    n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) s[--n] = '\0';
+}
+
+static int find_macro(const char *name)
+{
+    int i;
+    for (i = 0; i < macro_count; i++)
+        if (strcmp(macros[i].name, name) == 0) return i;
+    return -1;
+}
+
+int define_macro(const char *line)
+{
+    char work[2048], *p, *name_start, *value_start;
+    Macro m;
+    int existing, i;
+
+    snprintf(work, sizeof(work), "%s", line);
+    p = work;
+    while (isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "#define", 7) != 0 || !isspace((unsigned char)p[7]))
+        return 0;
+    p += 7;
+    while (isspace((unsigned char)*p)) p++;
+
+    name_start = p;
+    while (isalnum((unsigned char)*p) || *p == '_') p++;
+    if (p == name_start) return -1;
+
+    memset(&m, 0, sizeof(m));
+    m.param_count = -1;
+    if ((size_t)(p - name_start) >= sizeof(m.name)) return -1;
+    memcpy(m.name, name_start, (size_t)(p - name_start));
+    m.name[p - name_start] = '\0';
+
+    /* Function-like macros require '(' immediately after the macro name. */
+    if (*p == '(') {
+        char *end = strchr(p, ')');
+        if (!end) return -1;
+        m.param_count = 0;
+        p++;
+        while (p < end) {
+            char *start;
+            while (p < end && (isspace((unsigned char)*p) || *p == ',')) p++;
+            if (p >= end) break;
+            start = p;
+            while (p < end && (isalnum((unsigned char)*p) || *p == '_')) p++;
+            if (p == start || m.param_count >= 20) return -1;
+            memcpy(m.params[m.param_count], start, (size_t)(p - start));
+            m.params[m.param_count][p - start] = '\0';
+            m.param_count++;
+            while (p < end && isspace((unsigned char)*p)) p++;
+            if (p < end && *p != ',') return -1;
+        }
+        p = end + 1;
+    }
+    value_start = p;
+    while (isspace((unsigned char)*value_start)) value_start++;
+    snprintf(m.value, sizeof(m.value), "%s", value_start);
+    trim(m.value);
+
+    existing = find_macro(m.name);
+    if (existing >= 0) macros[existing] = m;
+    else {
+        if (macro_count >= MAX_MACROS) return -1;
+        macros[macro_count++] = m;
+    }
+    /* Silence an otherwise unused local warning on some compilers. */
+    for (i = 0; i < 0; i++) { }
+    return 1;
+}
+
+static void append_text(char *out, int cap, int *used, const char *s, size_t n)
+{
+    if (*used >= cap - 1) return;
+    if (n > (size_t)(cap - 1 - *used)) n = (size_t)(cap - 1 - *used);
+    memcpy(out + *used, s, n);
+    *used += (int)n;
+    out[*used] = '\0';
+}
+
+static void expand(const char *input, char *output, int cap, int depth);
+
+static void expand_function(const Macro *m, const char *args_text,
+                            char *out, int cap, int depth)
+{
+    char args[20][MACRO_VALUE];
+    char body[MACRO_VALUE * 2], temp[MACRO_VALUE * 2];
+    const char *p = args_text;
+    int argc = 0, level = 0, in_string = 0;
+    size_t pos = 0, i;
+    int used = 0;
+
+    if (m->param_count == 0) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p != ')') return;
+    } else {
+        while (*p && argc < 20) {
+            size_t len = 0;
+            while (*p && isspace((unsigned char)*p)) p++;
+            level = 0; in_string = 0;
+            while (*p) {
+                if (*p == '"' && (p == args_text || p[-1] != '\\')) in_string = !in_string;
+                if (!in_string && *p == '(') level++;
+                if (!in_string && *p == ')') {
+                    if (level == 0) break;
+                    level--;
+                }
+                if (!in_string && *p == ',' && level == 0) break;
+                if (len < sizeof(args[0]) - 1) args[argc][len++] = *p;
+                p++;
+            }
+            args[argc][len] = '\0';
+            trim(args[argc]);
+            argc++;
+            if (*p == ',') { p++; continue; }
+            break;
+        }
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p != ')' || argc != m->param_count) return;
+    }
+    p = m->value;
+    while (*p && pos < sizeof(body) - 1) body[pos++] = *p++;
+    body[pos] = '\0';
+
+    /* Replace parameter identifiers in the macro body. */
+    for (i = 0; body[i] && used < (int)sizeof(temp) - 1;) {
+        if (isalpha((unsigned char)body[i]) || body[i] == '_') {
+            size_t start = i, len;
+            char id[MACRO_NAME];
+            while (isalnum((unsigned char)body[i]) || body[i] == '_') i++;
+            len = i - start;
+            if (len >= sizeof(id)) len = sizeof(id) - 1;
+            memcpy(id, body + start, len); id[len] = '\0';
+            {
+                int k, replaced = 0;
+                for (k = 0; k < m->param_count; k++) {
+                    if (strcmp(id, m->params[k]) == 0) {
+                        size_t alen = strlen(args[k]);
+                        if (alen > sizeof(temp) - 1 - (size_t)used)
+                            alen = sizeof(temp) - 1 - (size_t)used;
+                        memcpy(temp + used, args[k], alen);
+                        used += (int)alen;
+                        replaced = 1;
+                        break;
+                    }
+                }
+                if (!replaced) {
+                    if (len > sizeof(temp) - 1 - (size_t)used)
+                        len = sizeof(temp) - 1 - (size_t)used;
+                    memcpy(temp + used, id, len); used += (int)len;
+                }
+            }
+        } else temp[used++] = body[i++];
+    }
+    temp[used] = '\0';
+    expand(temp, out, cap, depth + 1);
+}
+
+static void expand(const char *input, char *output, int cap, int depth)
+{
+    int used = 0;
+    const char *p = input;
+    output[0] = '\0';
+    if (depth > 10) {
+        snprintf(output, (size_t)cap, "%s", input);
+        return;
+    }
+
+    while (*p && used < cap - 1) {
+        if (*p == '"' || *p == '\'') {
+            char quote = *p;
+            append_text(output, cap, &used, p++, 1);
+            while (*p) {
+                char c = *p;
+                append_text(output, cap, &used, p++, 1);
+                if (c == '\\' && *p) append_text(output, cap, &used, p++, 1);
+                else if (c == quote) break;
+            }
+        } else if (isalpha((unsigned char)*p) || *p == '_') {
+            char id[MACRO_NAME];
+            size_t n = 0;
+            int idx;
+            const char *start = p;
+            while (isalnum((unsigned char)*p) || *p == '_') {
+                if (n < sizeof(id) - 1) id[n++] = *p;
+                p++;
+            }
+            id[n] = '\0';
+            idx = find_macro(id);
+            if (idx < 0) append_text(output, cap, &used, start, (size_t)(p - start));
+            else if (macros[idx].param_count < 0) {
+                char repl[MACRO_VALUE * 2];
+                expand(macros[idx].value, repl, (int)sizeof(repl), depth + 1);
+                append_text(output, cap, &used, repl, strlen(repl));
+            } else {
+                const char *q = p;
+                while (isspace((unsigned char)*q)) q++;
+                if (*q != '(') append_text(output, cap, &used, start, (size_t)(p - start));
+                else {
+                    char repl[MACRO_VALUE * 2];
+                    const char *argstart = q + 1;
+                    int level = 0, quoted = 0;
+                    q++;
+                    while (*q) {
+                        if (*q == '"' && (q == argstart || q[-1] != '\\')) quoted = !quoted;
+                        if (!quoted && *q == '(') level++;
+                        else if (!quoted && *q == ')') {
+                            if (level == 0) break;
+                            level--;
+                        }
+                        q++;
+                    }
+                    if (*q == ')') {
+                        expand_function(&macros[idx], argstart, repl, (int)sizeof(repl), depth);
+                        append_text(output, cap, &used, repl, strlen(repl));
+                        p = q + 1;
+                    } else append_text(output, cap, &used, start, (size_t)(p - start));
+                }
+            }
+        } else append_text(output, cap, &used, p++, 1);
+    }
+}
+
+void substitute_macros(const char *input, char *output, int output_size)
+{
+    expand(input, output, output_size, 0);
+}
